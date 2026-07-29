@@ -392,9 +392,58 @@ foreach ($ring in $rings) {
 
 ### Step 2.4 — Trigger and Alerting
 
-1. Create a Logic App with a monthly recurrence (weekDays Tuesday, monthlyOccurrences second) that invokes the runbook.
-2. Create an Azure Monitor alert on the Automation job status (Failed/Suspended) to operations — a silent failure means no drivers ship that month.
-3. Emit a success summary (per-ring approval counts) for the operations record.
+A Consumption-plan Logic App is sufficient — this fires once a month. The three pieces below (trigger, invocation, alerting) are each more involved than a one-line summary suggests; each is covered in full.
+
+2.4.1 — Recurrence trigger (second Tuesday)
+
+Add a Recurrence trigger in the designer, then switch to Code view (or the underlying Workflow Definition Language) and replace the auto-generated recurrence object with the following — the visual designer's Month-frequency option typically only exposes a fixed day-of-month, not 'second Tuesday':
+
+```powershell
+{
+  "type": "Recurrence",
+  "recurrence": {
+    "frequency": "Month",
+    "interval": 1,
+    "schedule": {
+      "monthlyOccurrences": [
+        { "day": "Tuesday", "occurrence": 2 }
+      ]
+    },
+    "startTime": "2026-08-01T22:00:00",
+    "timeZone": "Central Europe Standard Time"
+  }
+}
+```
+
+> [!NOTE]
+> occurrence: 2 means the second occurrence of Tuesday in the month — this is the actual mechanism, not an approximation. Set startTime/timeZone to match your operations team's locale; the trigger fires at 22:00 in that zone on the computed date, which does not need to match the client-side maintenance hour used elsewhere in this guide (those are device-local, this is a single operations-team schedule).
+
+2.4.2 — Invoke the runbook
+
+1. Add an action from the Azure Automation connector: Create job. Fill in subscription, resource group, Automation Account, and runbook name. No input parameters are needed.
+> [!WARNING]
+> The Azure Automation connector needs its OWN authenticated connection — separate from the runbook's managed identity and separate from your own testing identity. When you add the action, it prompts you to create a connection (typically Azure Resource Manager OAuth, signed in as a user). That identity needs RBAC rights on the Automation Account (e.g. Automation Contributor, or a role granting Microsoft.Automation/automationAccounts/jobs/write) — signing in as your own admin account works because you likely already have Owner, but for a repeatable production setup, use a dedicated service identity for this connection rather than a personal login. This is now a THIRD identity in the overall picture, alongside the runbook's managed identity and your own testing identity — keep track of which one is acting when something fails to authorize.
+
+2.4.3 — Success summary: use the reporting sink, don't try to capture it in the Logic App
+
+A bare Create job action is fire-and-forget: it does not wait for the runbook to finish or return its output, so the Logic App itself cannot easily produce a per-run summary. Two options:
+
+| Option | Approach |
+| --- | --- |
+| A — Decoupled (recommended) | Do nothing extra in the Logic App. Write-ApprovalRecord already logs every approval to DriverApprovals_CL with a RecordedUtc timestamp. The 'summary' is a KQL query against that table for the current date, run manually or as a small separate scheduled report. Simpler, and does not couple the trigger to job completion. |
+| B — Self-contained | Replace Create job with the 'Create job and wait for it to finish using a webhook' composite action, which polls until completion and returns output, then branch on success/failure and send email/Teams from the same flow. More complete, but a longer-running and more fragile workflow (polling a job that may run for minutes). |
+
+2.4.4 — Failure alerting (native Azure Monitor, not the Logic App)
+
+This should be a separate alert on the Automation Account, not something built into the Logic App — a Logic App failure and a runbook job failure are different failure modes and need to be caught independently.
+
+2. Automation Account > Alerts > New alert rule.
+3. Signal: the Activity Log signal Job Status, or a Metric alert on Total Jobs split by Status, filtered to Failed / Suspended.
+4. Action group: email/Teams/whatever channel operations actually watches.
+5. Scope the alert to just this Automation Account, not the subscription.
+> [!NOTE]
+> This alert catches a runbook job that ran and failed. It does NOT catch the Logic App itself failing to trigger the job at all. Separately enable Logic App diagnostic settings (send run history to Log Analytics) or periodically check its run history, so a silent trigger failure — no job created at all — doesn't go unnoticed the same way a failed job would.
+
 > [!WARNING]
 > Every read, approve, verify, and revoke call in this guide was validated using DELEGATED admin authentication (Connect-MgGraph / Connect-AzAccount as a signed-in user), which is how local testing in VS Code or Graph Explorer works. The runbook's MANAGED IDENTITY path — Connect-AzAccount -Identity inside the actual Automation Account — has NOT been separately validated end to end. Delegated and managed-identity auth are different code paths in Azure AD; a working local test does not guarantee the managed identity run succeeds. Before relying on this in production, run the runbook once in Azure and confirm: (1) the Graph calls succeed with the MI's granted permissions, (2) the Log Analytics ingestion succeeds with the MI's DCR role. If either fails, the MI's app role / RBAC assignment is the first thing to check — not the script logic, which is already proven.
 
